@@ -1,0 +1,19 @@
+{
+  "package": "ComfyUI-WepeNerd-LocalAI",
+  "source_commit": "41d75b3a4611d7aabac7f50444aa78eb07bdcbfe",
+  "nodes": {
+    "WN_LocalAIModel": "wn_gguf_nodes",
+    "WN_PromptEnhancer": "wn_gguf_nodes",
+    "WN_H3PromptEnhancer": "wn_gguf_nodes",
+    "WN_ImageCaptioner": "wn_gguf_nodes",
+    "WN_FolderCaptioner": "wn_gguf_nodes",
+    "WN_VideoCaptioner": "wn_gguf_nodes",
+    "WN_GGUFLLMConfig": "wn_gguf_nodes",
+    "WN_GGUFLLMGenerate": "wn_gguf_nodes",
+    "WN_GGUFPromptEnhance": "wn_gguf_nodes",
+    "WN_GGUFCaptionImage": "wn_gguf_nodes",
+    "WN_GGUFCaptionVideo": "wn_gguf_nodes",
+    "WN_GGUFLLMRelease": "wn_gguf_nodes",
+    "WN_GGUFLLMStatus": "wn_gguf_nodes"
+  }
+}

@@ -1,0 +1,13 @@
+[project]
+name = "wepenerd-localai"
+version = "0.1.0"
+description = "Local AI prompt enhancement and image, video, and folder captioning for ComfyUI."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["Pillow", "numpy", "av"]
+
+
+[project.urls]
+Repository = "https://github.com/WepeNerd/ComfyUI-WepeNerd-LocalAI"
+Issues = "https://github.com/WepeNerd/ComfyUI-WepeNerd-LocalAI/issues"
