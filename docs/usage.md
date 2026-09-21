@@ -73,6 +73,14 @@ Both simple prompt enhancers recognize Qwen 3.8 27B from the model filename, inc
 
 Video auto mode checks llama-server `/props`: it uses typed native `input_video` only when video support is explicit, otherwise it sends timestamped JPEG frames. Missing metadata is treated as unknown and falls back conservatively. File-backed clips use PyAV seek sampling, so memory scales with selected frames rather than total clip length. Audio and dialogue are not inferred.
 
+## Qwen Image 2.1
+
+`Prompt Enhancer` includes Generate, Edit, and Image 2 into Image 1 skills for
+Qwen Image 2.1. Use `image` for the canvas and `reference_images` for additional
+sources. Connect the same originals to your Qwen workflow in the same order.
+See the [researched prompting and editing guide](qwen-image-2.1.md) for setup,
+common tasks, source links, and preservation limits.
+
 ## Local AI / Advanced
 
 **Category:** `WepeNerd/Local AI/Advanced`

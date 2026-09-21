@@ -12,6 +12,9 @@ BUILTIN_SKILLS = {
     "krea2_character_caption": "Krea2_Character_Caption.md",
     "krea2_style_caption": "Krea2_Style_Caption.md",
     "krea2_refiner_caption": "Krea2_Refiner_Caption.md",
+    "qwen_image_2_1": "Qwen_Image_2_1_Generate.md",
+    "qwen_image_2_1_edit": "Qwen_Image_2_1_Edit.md",
+    "qwen_image_2_1_compose": "Qwen_Image_2_1_Edit.md",
 }
 
 _SKILLS_DIR = (Path(__file__).resolve().parent / "skills").resolve()

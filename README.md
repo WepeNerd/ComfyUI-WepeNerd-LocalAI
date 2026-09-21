@@ -6,7 +6,7 @@ One model connection serves all task nodes through your installed llama.cpp serv
 | Node | What it does |
 |---|---|
 | **Local AI Model** | Select a GGUF model and optional vision projector |
-| **Prompt Enhancer** | Expand or refine prompts using H3, Krea2, or custom instructions |
+| **Prompt Enhancer** | Expand or refine prompts using H3, Krea2, Qwen Image 2.1, or custom instructions |
 | **H3 Prompt Enhancer** | Build structured H3 prompts with control over creative freedom and image roles |
 | **Image Captioner** | Caption every image in a batch |
 | **Folder Captioner** | Write matching caption files beside a folder of images |
@@ -52,6 +52,10 @@ controlled by the node's overwrite option.
 
 See [usage and advanced settings](docs/usage.md) and the
 [folder captioning guide](docs/folder-captioning.md).
+
+For Qwen generation, precise edits, and placing image 2's subject into image 1,
+see the [Qwen Image 2.1 guide](docs/qwen-image-2.1.md). The enhancer accepts a
+canvas through `image` and a separate source through `reference_images`.
 
 ## Memory and model lifecycle
 
