@@ -2,7 +2,7 @@
 
 ## Folder captioning
 
-Connect **Local AI Model â†’ Folder Captioner**, select a compatible vision model
+Connect **Local AI Model → Folder Captioner**, select a compatible vision model
 and projector, enter an absolute image folder path, choose a **skill**, and click
 **Queue** once. The node runs as an output node without another connection.
 `photo.001.jpg` becomes `photo.001.txt` in the same directory, containing only its
@@ -16,6 +16,12 @@ The connected model's release/keep-alive policy applies when the batch ends.
 | `Krea 2 - Style` | Describe scene content while leaving the target visual treatment implicit. |
 | `Krea 2 - Refiner` | Name the known concept and describe visible distinguishing structure and details. This prepares training captions; it does not refine images. |
 | `General caption` / `Custom` | General visual description, or the complete skill supplied in `instruction`. |
+| `Dataset`, `Detailed`, `Short`, `Tags`, `Motion + Camera` | The Image Captioner styles. `trigger_word` and `concept_context` are passed along when supplied. |
+
+Image Captioner and Image Captioner (Advanced) offer the same skills and the same
+`trigger_word` / `concept_context` inputs, so you can check a skill on one image
+before captioning a whole folder. On those nodes a missing trigger word is added
+to the start of the caption instead of stopping the run.
 
 `trigger_word` is optional and must be reproduced exactly when supplied. Use
 `concept_context` for facts and the learning goal shared by the folder, such as
@@ -62,7 +68,7 @@ For a basic outline such as `A traveler finds an abandoned lighthouse`, use `Fil
 
 With an image connected, `Auto` selects T2V for Visual inspiration, I2V for First frame, or Ref2V for Reference image. An explicit mode takes priority. Without an image, `Auto` infers from text. The enhancer can inspect only the images connected to it and cannot inspect the downstream graph. Specific modes load only their relevant appendix; the generic H3 skill remains complete.
 
-Connect `Load Image â†’ image` and `Local AI Model â†’ model`, choose an image role, and run with a blank prompt for an original short video scenario. For image-only input, the H3 node automatically uses `Develop scenario` when creative freedom is left on `Preserve`; text plus image follows your direction and chosen creative freedom. The image is sent to the local LLM only: connect it separately to H3 when using it as a first frame or generation reference. The same image inputs are available on `Prompt Enhancer` and `Prompt Enhancer (Advanced)`, including their H3 skill/style.
+Connect `Load Image → image` and `Local AI Model → model`, choose an image role, and run with a blank prompt for an original short video scenario. For image-only input, the H3 node automatically uses `Develop scenario` when creative freedom is left on `Preserve`; text plus image follows your direction and chosen creative freedom. The image is sent to the local LLM only: connect it separately to H3 when using it as a first frame or generation reference. Choosing `H3` in `Prompt Enhancer` runs this same node with every H3 option on Auto, including its output checks. `Prompt Enhancer (Advanced)` keeps the raw H3 skill with your sampler settings and no checks. Filling in `system_prompt_override` also bypasses the H3 node. `reference_images` works here as on Prompt Enhancer.
 
 Image batches are sent together for one prompt. In First frame mode, only the first image anchors the opening; additional images supply visual guidance. Reference images default to `<Picture 1>`, `<Picture 2>`, etc. in attachment order when no Picture aliases are supplied. For a different workflow numbering, state the attachment mapping in `reference_context`, e.g. `Attached image 1 = <Picture 0>: character identity.` Each image uses the existing in-memory JPEG encoder with a maximum edge of 1024 pixels.
 
@@ -72,6 +78,17 @@ Both simple prompt enhancers recognize Qwen 3.8 27B from the model filename, inc
 
 
 Video auto mode checks llama-server `/props`: it uses typed native `input_video` only when video support is explicit, otherwise it sends timestamped JPEG frames. Missing metadata is treated as unknown and falls back conservatively. File-backed clips use PyAV seek sampling, so memory scales with selected frames rather than total clip length. Audio and dialogue are not inferred.
+
+## Instructions and Custom
+
+Every enhancer and captioner has an `instruction` input that adds your direction to
+the selected skill, for example "keep it under 60 words". With `Custom`, the
+instruction is the whole skill. `system_prompt_override` (advanced) replaces the
+skill's built-in instructions entirely.
+
+Skill and style names are the same on the simple and advanced nodes. Advanced nodes
+still accept the older internal names (such as `minimax_h3` or `booru_tags`) stored
+in saved workflows.
 
 ## Qwen Image 2.1
 
@@ -90,14 +107,24 @@ Use the advanced nodes for raw generation, a custom context size, GPU layers, KV
 | Node | Purpose |
 |---|---|
 | `Local AI Model (Advanced)` | Full model, server, memory, and lifecycle configuration |
-| `Local AI Generate` | General text generation with optional image input |
-| `Prompt Enhancer (Advanced)` | Legacy styles and sampler controls, including H3 and Krea 2 |
-| `Image Captioner (Advanced)` | Caption cleanup, encoding, and sampler controls |
-| `Video Captioner (Advanced)` | Native/sampled modes and sampling controls |
+| `Local AI Sampling` | Generation settings (max tokens, temperature, top-p/k, penalties, seed, reasoning, image size, caption prefix and banned phrases). Connect it to the `sampling` input of Prompt Enhancer, H3 Prompt Enhancer, Image, Folder or Video Captioner; its values replace that node's built-in ones |
+| `Video Captioner (Advanced)` | Native/sampled video modes and frame sampling controls |
 | `Local AI Status` | Report the managed server and advertised modalities |
-| `Unload Local AI Model` | Stop a resident keep-alive server |
+| `Unload Local AI Model` | Stop a resident keep-alive server. Put it inline with `passthrough` so the next step waits for the unload |
 
-`release_after_generate = false` is an advanced speed option for consecutive calls. `keep_alive_seconds` can release an idle server automatically; zero means manual indefinite keep-alive. While resident, external llama.cpp VRAM is invisible to ComfyUI, so run `Unload Local AI Model` before returning to a heavy diffusion or video branch and create an actual STRING dependency edge when sequencing matters.
+`Local AI Generate` moved to the main Local AI category. `Prompt Enhancer (Advanced)`
+and `Image Captioner (Advanced)` are deprecated: ComfyUI hides them from search, but
+saved workflows still load and run. Use the simple node plus Local AI Sampling instead.
+
+Local AI Sampling starts with `reasoning_effort = default`: `qwen_thinking` selects
+`high`, `qwen_non_thinking` selects `none`, and `custom` leaves reasoning to the model.
+An explicit effort overrides the preset, including the built-in Qwen thinking setting
+on the prompt enhancers. Without Sampling connected, enhancer defaults are unchanged.
+Folder Captioner honors Sampling's JPEG quality and validates captions again after
+prefix and banned-phrase cleanup. If cleanup empties a caption or removes its required
+trigger, that caption is not written; completed files remain available for resuming.
+
+`release_after_generate = false` is an advanced speed option for consecutive calls. `keep_alive_seconds` can release an idle server automatically; zero means manual indefinite keep-alive. While resident, external llama.cpp VRAM is invisible to ComfyUI, so run `Unload Local AI Model` before returning to a heavy diffusion or video branch. Route any value through its `passthrough` input and output so the next step waits for the unload.
 
 Advanced config includes Flash Attention, F16/Q8 KV caches, vision-token bounds, and child-only `CUDA_VISIBLE_DEVICES`. For a dedicated secondary GPU, set `cuda_visible_devices` and choose `comfy_vram_handoff = never`; this does not modify ComfyUI's own environment. Q8 KV caches save memory but can change speed or quality slightly.
 

@@ -38,7 +38,7 @@ def load_skill(name: str) -> str:
         stat = path.stat()
     except OSError as exc:
         raise FileNotFoundError(
-            f"Bundled Local AI skill is missing: {path}. Reinstall ComfyUI-WepeNerd."
+            f"Bundled Local AI skill is missing: {path}. Reinstall ComfyUI-WepeNerd-LocalAI."
         ) from exc
 
     signature = (stat.st_mtime_ns, stat.st_size)
@@ -52,7 +52,7 @@ def load_skill(name: str) -> str:
     except (OSError, UnicodeError) as exc:
         raise RuntimeError(f"Could not read bundled Local AI skill {path}: {exc}") from exc
     if not text:
-        raise ValueError(f"Bundled Local AI skill is empty: {path}. Reinstall ComfyUI-WepeNerd.")
+        raise ValueError(f"Bundled Local AI skill is empty: {path}. Reinstall ComfyUI-WepeNerd-LocalAI.")
 
     with _cache_lock:
         _cache[key] = (*signature, text)

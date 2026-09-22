@@ -19,7 +19,7 @@ from .wn_gguf_caption_folder import (
 )
 from .wn_gguf_config import WNGGUFConfig
 from .wn_gguf_image import comfy_image_to_data_url, encode_image_batch
-from .wn_gguf_models import discover_models, discover_projectors, resolve_choice
+from .wn_gguf_models import discover_models, discover_projectors, match_projector, resolve_choice
 from .wn_gguf_payloads import (
     REASONING_EFFORTS,
     build_chat_payload,
@@ -87,13 +87,180 @@ VIDEO_CAPTION_STYLES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Skill catalogs: one named list per task, shared by the simple and advanced nodes.
+# Advanced nodes still accept their older internal names so saved workflows load.
+# ---------------------------------------------------------------------------
+
+PROMPT_SKILLS = {
+    "H3": "minimax_h3",
+    "Krea 2": "krea2",
+    **QWEN_IMAGE_SKILLS,
+    "Flux": "flux",
+    "Wan": "wan",
+    "LTX Video": "ltx_video",
+    "SDXL": "sdxl",
+    "Generic": "generic",
+    "Custom": "custom",
+}
+
+IMAGE_CAPTION_SKILLS = {
+    "Dataset": "dataset_natural",
+    "Detailed": "detailed_visual",
+    "Short": "short",
+    "Tags": "booru_tags",
+    "Motion + Camera": "motion_camera",
+    "General caption": "General caption",
+    "Krea 2 - Character likeness": "Krea 2 - Character likeness",
+    "Krea 2 - Style": "Krea 2 - Style",
+    "Krea 2 - Refiner": "Krea 2 - Refiner",
+    "Custom": "custom",
+}
+
+VIDEO_CAPTION_SKILLS = {
+    "Dataset": "dataset_natural",
+    "Detailed": "detailed_visual",
+    "Motion + Camera": "motion_camera",
+    "Short": "short",
+    "Custom": "custom",
+}
+
+DEFAULT_IMAGE_INSTRUCTION = "Describe this image accurately and in detail."
+_CAPTION_CONTEXT_RULES = (
+    " Include trigger_word exactly as written if supplied. Use concept_context only where it applies. "
+    "Do not infer identity, ethnicity, nationality, or exact age from appearance."
+)
+
+
+def _resolve_skill(value, catalog, kind):
+    """Map a display name (or an older internal name) to the internal skill id."""
+    if value in catalog:
+        return catalog[value]
+    if value in catalog.values():
+        return value
+    raise ValueError(f"Unknown {kind}: {value!r}. Choose one of: {', '.join(catalog)}")
+
+
+def _check_skill(value, catalog, kind):
+    try:
+        _resolve_skill(value, catalog, kind)
+    except ValueError as exc:
+        return str(exc)
+    return True
+
+
+def _add_direction(system_prompt, instruction):
+    """Append the user's extra direction to a skill without replacing it."""
+    instruction = (instruction or "").strip()
+    if not instruction:
+        return system_prompt
+    return (f"{system_prompt}\n\nAdditional direction from the user. Follow it; it takes priority over "
+            f"the defaults above:\n{instruction}")
+
+
+def _image_caption_instructions(skill, instruction, trigger_word="", concept_context="", override=""):
+    """Return (system_prompt, user_prompt, cleanup_style) for any image caption skill.
+
+    Used by Image Captioner, Image Captioner (Advanced) and Folder Captioner so every
+    caption skill behaves the same wherever it is picked.
+    """
+    key = _resolve_skill(skill, IMAGE_CAPTION_SKILLS, "caption skill")
+    override = (override or "").strip()
+    if key == "custom":
+        system, user = caption_instructions("Custom", trigger_word, concept_context, override or instruction)
+        return system, user, "custom"
+    if key in CAPTION_SKILLS:
+        system, user = caption_instructions(key, trigger_word, concept_context, instruction)
+        return override or system, user, "dataset_natural"
+    system = override or IMAGE_CAPTION_STYLES[key]
+    user = (instruction or "").strip() or DEFAULT_IMAGE_INSTRUCTION
+    if trigger_word.strip() or concept_context.strip():
+        system += _CAPTION_CONTEXT_RULES
+        user += "\n" + json.dumps({"trigger_word": trigger_word.strip(),
+                                   "concept_context": concept_context.strip()}, ensure_ascii=False)
+    return system, user, key
+
+
+def _finish_image_caption(value, cleanup_style, trigger_word="", prefix="", banned_phrases=""):
+    value = _clean_caption(value, cleanup_style, prefix, banned_phrases)
+    trigger = (trigger_word or "").strip()
+    if trigger and not re.search(r"(?<!\w)" + re.escape(trigger) + r"(?!\w)", value):
+        value = f"{trigger}, {value}"
+    return value
+
+
+MEMORY_MODES = [
+    "Unload ComfyUI models first",
+    "Free only what the LLM needs",
+    "Keep LLM loaded for 5 min",
+]
+
+
+def _estimated_vram_mb(model_path, mmproj_path):
+    """Rough VRAM need: weights plus headroom for an 8K context and compute buffers."""
+    def size_mb(path):
+        try:
+            return os.path.getsize(path) / (1024 * 1024) if path else 0.0
+        except OSError:
+            return 0.0
+    estimate = size_mb(model_path) * 1.15 + size_mb(mmproj_path) + 1536
+    return int(math.ceil(max(estimate, 2048) / 256.0) * 256)
+
+
+class _AnyType(str):
+    """Wildcard socket type: connects to any output."""
+
+    def __ne__(self, other):
+        return False
+
+
+ANY_TYPE = _AnyType("*")
+SAMPLING_TYPE = "LOCAL_AI_SAMPLING"
+
+
+def _apply_sampling(payload, sampling):
+    """Override a built payload with a connected Local AI Sampling bundle."""
+    if not sampling:
+        return payload
+    for key in ("max_tokens", "temperature", "top_p", "top_k", "min_p",
+                "presence_penalty", "frequency_penalty", "seed"):
+        payload[key] = sampling[key]
+    payload["repeat_penalty"] = sampling["repetition_penalty"]
+    if sampling["reasoning_effort"] == "default":
+        payload.pop("reasoning_effort", None)
+    else:
+        payload["reasoning_effort"] = sampling["reasoning_effort"]
+    template_kwargs = payload.get("chat_template_kwargs", {})
+    if "enable_thinking" in template_kwargs:
+        if sampling["reasoning_effort"] == "default":
+            del template_kwargs["enable_thinking"]
+            if not template_kwargs:
+                payload.pop("chat_template_kwargs", None)
+        else:
+            template_kwargs["enable_thinking"] = sampling["reasoning_effort"] != "none"
+    return payload
+
+
+def _image_count(content):
+    return sum(isinstance(part, dict) and part.get("type") == "image_url" for part in (content or []))
+
+
+SEED_WIDGET = ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
+    "tooltip": "Change this number to get a different version. The same seed and inputs give the same result, "
+               "and ComfyUI skips re-running the node until something changes."})
+
+
 def _model_choices():
     models = discover_models()
     return models or ["<put .gguf models in ComfyUI/models/LLM>"]
 
 
+PROJECTOR_AUTO = "Auto / None"
+PROJECTOR_NONE = "None"
+
+
 def _clean_projector_choices():
-    return ["Auto / None", *[item for item in discover_projectors() if item != "(none)"]]
+    return [PROJECTOR_AUTO, PROJECTOR_NONE, *[item for item in discover_projectors() if item != "(none)"]]
 
 
 def _split_extra_args(value: str) -> tuple[str, ...]:
@@ -194,8 +361,12 @@ def _enhancement_image_content(config, prompt, image, image_role, reference_imag
     return content
 
 
-def _prepare_prompt_enhancement(config, prompt, style, override, image, image_role, reference_images):
-    system_prompt = _style_prompt(style, PROMPT_STYLES, override)
+def _prepare_prompt_enhancement(config, prompt, style, override, image, image_role, reference_images, instruction=""):
+    if style == "custom" and not override.strip():
+        if not (instruction or "").strip():
+            raise ValueError("Custom needs your instructions: fill in instruction (or system_prompt_override).")
+        override, instruction = instruction, ""
+    system_prompt = _add_direction(_style_prompt(style, PROMPT_STYLES, override), instruction)
     if style in QWEN_IMAGE_SKILLS.values():
         if (image is not None or reference_images is not None) and not config.mmproj_path:
             raise ValueError("IMAGE input requires a vision-capable model and its compatible mmproj. Select the projector in Local AI Model.")
@@ -205,12 +376,12 @@ def _prepare_prompt_enhancement(config, prompt, style, override, image, image_ro
     return prompt, system_prompt, content
 
 
-def _enhancement_payload(model_path, prompt, system_prompt, max_tokens=2048, user_content=None):
+def _enhancement_payload(model_path, prompt, system_prompt, max_tokens=2048, user_content=None, seed=0):
     model_name = re.sub(r"[^a-z0-9]", "", os.path.basename(model_path).lower())
     qwen38 = "qwen38" in model_name and "27b" in model_name
     payload = _make_payload(
         prompt, system_prompt, max_tokens, 0.7 if qwen38 else 0.2, 0.8, 20, 0.0,
-        1.0 if qwen38 else 1.05, 1.5 if qwen38 else 0.0, 0.0, 0, "none", user_content=user_content,
+        1.0 if qwen38 else 1.05, 1.5 if qwen38 else 0.0, 0.0, int(seed), "none", user_content=user_content,
     )
     if qwen38:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
@@ -436,7 +607,7 @@ class WN_GGUFLLMGenerate:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("generated_text",)
     FUNCTION = "generate"
-    CATEGORY = "WepeNerd/Local AI/Advanced"
+    CATEGORY = "WepeNerd/Local AI"
 
     def generate(
         self, config, prompt, system_prompt, max_tokens, temperature, top_p, top_k,
@@ -471,7 +642,7 @@ class WN_GGUFPromptEnhance:
                 "max_tokens": ("INT", {"default": 512, "min": 1, "max": 4096}),
                 "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
-                "prompt_style": (list(PROMPT_STYLES) + ["custom"],),
+                "prompt_style": (list(PROMPT_SKILLS), {"default": "Generic"}),
                 "reasoning_effort": (list(REASONING_EFFORTS), {"default": "none"}),
             },
             "optional": {
@@ -480,6 +651,7 @@ class WN_GGUFPromptEnhance:
                 "image_role": (list(ENHANCEMENT_IMAGE_ROLES), {"default": "Visual inspiration",
                     "tooltip": "Image role for other styles. Qwen Image 2.1 uses the chosen style and the roles in your prompt."}),
                 "reference_images": ("IMAGE", {"tooltip": "Additional references, appended after image. Connect one canvas to image and one source here for image 2 into image 1; sizes may differ. Both inputs accept batches."}),
+                "instruction": ("STRING", {"multiline": True, "default": ""}),
             },
         }
 
@@ -487,10 +659,16 @@ class WN_GGUFPromptEnhance:
     RETURN_NAMES = ("enhanced_prompt",)
     FUNCTION = "enhance"
     CATEGORY = "WepeNerd/Local AI/Advanced"
+    DEPRECATED = True  # Prompt Enhancer + Local AI Sampling covers this; kept so saved workflows load.
 
-    def enhance(self, config, prompt, max_tokens, temperature, seed, prompt_style="generic", reasoning_effort="none", system_prompt_override="", image=None, image_role="Visual inspiration", reference_images=None):
+    @classmethod
+    def VALIDATE_INPUTS(cls, prompt_style):
+        return _check_skill(prompt_style, PROMPT_SKILLS, "prompt_style")
+
+    def enhance(self, config, prompt, max_tokens, temperature, seed, prompt_style="Generic", reasoning_effort="none", system_prompt_override="", image=None, image_role="Visual inspiration", reference_images=None, instruction=""):
+        prompt_style = _resolve_skill(prompt_style, PROMPT_SKILLS, "prompt_style")
         prompt, system_prompt, content = _prepare_prompt_enhancement(
-            config, prompt, prompt_style, system_prompt_override, image, image_role, reference_images,
+            config, prompt, prompt_style, system_prompt_override, image, image_role, reference_images, instruction,
         )
         _validate_request(config, prompt, max_tokens)
         payload = _make_payload(
@@ -512,7 +690,7 @@ class WN_GGUFCaptionImage:
                 "max_tokens": ("INT", {"default": 512, "min": 1, "max": 4096}),
                 "temperature": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
-                "caption_style": (list(IMAGE_CAPTION_STYLES) + ["custom"],),
+                "caption_style": (list(IMAGE_CAPTION_SKILLS),),
                 "reasoning_effort": (list(REASONING_EFFORTS), {"default": "none"}),
             },
             "optional": {
@@ -521,6 +699,8 @@ class WN_GGUFCaptionImage:
                 "banned_phrases": ("STRING", {"multiline": True, "default": ""}),
                 "image_max_edge": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 64}),
                 "jpeg_quality": ("INT", {"default": 90, "min": 1, "max": 100}),
+                "trigger_word": ("STRING", {"default": ""}),
+                "concept_context": ("STRING", {"multiline": True, "default": ""}),
             },
         }
 
@@ -529,27 +709,39 @@ class WN_GGUFCaptionImage:
     OUTPUT_IS_LIST = (True,)
     FUNCTION = "caption"
     CATEGORY = "WepeNerd/Local AI/Advanced"
+    DEPRECATED = True  # Image Captioner + Local AI Sampling covers this; kept so saved workflows load.
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, caption_style):
+        return _check_skill(caption_style, IMAGE_CAPTION_SKILLS, "caption_style")
 
     def caption(
         self, config, image, instruction, max_tokens, temperature, seed,
-        caption_style="dataset_natural", reasoning_effort="none",
+        caption_style="Dataset", reasoning_effort="none",
         system_prompt_override="", caption_prefix="", banned_phrases="",
-        image_max_edge=1024, jpeg_quality=90,
+        image_max_edge=1024, jpeg_quality=90, trigger_word="", concept_context="", sampling=None,
     ):
-        _validate_request(config, instruction, max_tokens)
+        if sampling:
+            max_tokens = sampling["max_tokens"]
+            image_max_edge, jpeg_quality = sampling["image_max_edge"], sampling["jpeg_quality"]
+            caption_prefix = sampling["caption_prefix"] or caption_prefix
+            banned_phrases = sampling["banned_phrases"] or banned_phrases
+        system_prompt, prompt, cleanup = _image_caption_instructions(
+            caption_style, instruction, trigger_word, concept_context, system_prompt_override,
+        )
+        _validate_request(config, prompt, max_tokens)
         if not config.mmproj_path:
-            raise ValueError("Image captioning requires an explicitly selected compatible mmproj")
-        system_prompt = _style_prompt(caption_style, IMAGE_CAPTION_STYLES, system_prompt_override)
+            raise ValueError("Image captioning requires a vision-capable model and its matching projector in Local AI Model")
         urls = encode_image_batch(image, image_max_edge, "JPEG", jpeg_quality)
         payloads = [
-            _make_payload(
-                instruction, system_prompt, max_tokens, temperature, 0.8, 20, 0.0,
+            _apply_sampling(_make_payload(
+                prompt, system_prompt, max_tokens, temperature, 0.8, 20, 0.0,
                 1.05, 0.0, 0.0, seed, reasoning_effort, image_data_url=url,
-            )
+            ), sampling)
             for url in urls
         ]
         captions = _run_payloads(config, payloads, require_image=True)
-        return ([_clean_caption(value, caption_style, caption_prefix, banned_phrases) for value in captions],)
+        return ([_finish_image_caption(value, cleanup, trigger_word, caption_prefix, banned_phrases) for value in captions],)
 
 
 def _video_payload(
@@ -566,13 +758,20 @@ def _caption_video_request(
     config, video, instruction, caption_style, video_mode, sampling_mode,
     sample_frames, sample_fps, max_frames, max_tokens, temperature, seed,
     system_prompt_override="", caption_prefix="", banned_phrases="",
-    image_max_edge=1024, jpeg_quality=90, reasoning_effort="none",
+    image_max_edge=1024, jpeg_quality=90, reasoning_effort="none", sampling=None,
 ):
+    if sampling:
+        max_tokens = sampling["max_tokens"]
+        image_max_edge, jpeg_quality = sampling["image_max_edge"], sampling["jpeg_quality"]
+        caption_prefix = sampling["caption_prefix"] or caption_prefix
+        banned_phrases = sampling["banned_phrases"] or banned_phrases
     _validate_request(config, instruction, max_tokens)
     if not config.mmproj_path:
         raise ValueError("Video captioning requires an explicitly selected compatible projector")
     if video_mode not in ("auto", "native_video", "sampled_frames"):
         raise ValueError(f"Unknown video mode: {video_mode}")
+    if caption_style == "custom" and not system_prompt_override.strip():
+        system_prompt_override = instruction  # Custom: the instruction is the whole skill
     system_prompt = _style_prompt(caption_style, VIDEO_CAPTION_STYLES, system_prompt_override)
 
     def run_sampled(handle):
@@ -591,7 +790,7 @@ def _caption_video_request(
             instruction, system_prompt, max_tokens, temperature, seed, reasoning_effort,
             sampled_video_content(instruction, sampled_media["urls"], sampled_media["timestamps"]),
         )
-        result = SERVER_MANAGER.chat_completion(handle, payload, config.request_timeout_s)
+        result = SERVER_MANAGER.chat_completion(handle, _apply_sampling(payload, sampling), config.request_timeout_s)
         return result, sampled_media
 
     def run_native(handle):
@@ -600,7 +799,7 @@ def _caption_video_request(
             instruction, system_prompt, max_tokens, temperature, seed, reasoning_effort,
             native_video_content(instruction, native_media["base64"]),
         )
-        result = SERVER_MANAGER.chat_completion(handle, payload, config.request_timeout_s)
+        result = SERVER_MANAGER.chat_completion(handle, _apply_sampling(payload, sampling), config.request_timeout_s)
         return result, native_media
 
     error = None
@@ -669,7 +868,7 @@ class WN_GGUFCaptionVideo:
                 "config": ("GGUF_LLM_CONFIG",),
                 "video": ("VIDEO",),
                 "instruction": ("STRING", {"multiline": True, "default": "Describe this video accurately, including subjects, actions, camera motion, setting, and meaningful changes over time."}),
-                "caption_style": (list(VIDEO_CAPTION_STYLES) + ["custom"],),
+                "caption_style": (list(VIDEO_CAPTION_SKILLS),),
                 "video_mode": (["auto", "native_video", "sampled_frames"],),
                 "sampling_mode": (["uniform", "fixed_fps"],),
                 "sample_frames": ("INT", {"default": 12, "min": 2, "max": 96}),
@@ -694,18 +893,74 @@ class WN_GGUFCaptionVideo:
     FUNCTION = "caption"
     CATEGORY = "WepeNerd/Local AI/Advanced"
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, caption_style):
+        return _check_skill(caption_style, VIDEO_CAPTION_SKILLS, "caption_style")
+
     def caption(
         self, config, video, instruction, caption_style, video_mode, sampling_mode,
         sample_frames, sample_fps, max_frames, max_tokens, temperature, seed,
         system_prompt_override="", caption_prefix="", banned_phrases="",
         image_max_edge=1024, jpeg_quality=90, reasoning_effort="none",
     ):
+        caption_style = _resolve_skill(caption_style, VIDEO_CAPTION_SKILLS, "caption_style")
         return _caption_video_request(
             config, video, instruction, caption_style, video_mode, sampling_mode,
             sample_frames, sample_fps, max_frames, max_tokens, temperature, seed,
             system_prompt_override, caption_prefix, banned_phrases,
             image_max_edge, jpeg_quality, reasoning_effort,
         )
+
+
+class WN_LocalAISampling:
+    """Generation settings bundle that any simple Local AI task node can use."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "preset": (["custom", "qwen_non_thinking", "qwen_thinking"],),
+                "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.01}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "top_k": ("INT", {"default": 20, "min": 0, "max": 1000}),
+                "min_p": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 0.0, "max": 5.0, "step": 0.01}),
+                "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
+                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
+                "reasoning_effort": (list(REASONING_EFFORTS), {"default": "default"}),
+            },
+            "optional": {
+                "image_max_edge": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 64}),
+                "jpeg_quality": ("INT", {"default": 90, "min": 1, "max": 100}),
+                "caption_prefix": ("STRING", {"default": ""}),
+                "banned_phrases": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = (SAMPLING_TYPE,)
+    RETURN_NAMES = ("sampling",)
+    FUNCTION = "build"
+    CATEGORY = "WepeNerd/Local AI/Advanced"
+
+    def build(self, preset, max_tokens, temperature, top_p, top_k, min_p, repetition_penalty,
+              presence_penalty, frequency_penalty, seed, reasoning_effort="default",
+              image_max_edge=1024, jpeg_quality=90, caption_prefix="", banned_phrases=""):
+        if preset not in ("custom", "qwen_non_thinking", "qwen_thinking"):
+            raise ValueError(f"Unknown sampling preset: {preset}")
+        if reasoning_effort not in REASONING_EFFORTS:
+            raise ValueError(f"Unknown reasoning_effort: {reasoning_effort}")
+        temperature, top_p, top_k, min_p, reasoning_effort = _sampler_values(
+            preset, temperature, top_p, top_k, min_p, reasoning_effort)
+        return ({
+            "max_tokens": int(max_tokens), "temperature": float(temperature), "top_p": float(top_p),
+            "top_k": int(top_k), "min_p": float(min_p), "repetition_penalty": float(repetition_penalty),
+            "presence_penalty": float(presence_penalty), "frequency_penalty": float(frequency_penalty),
+            "seed": int(seed), "reasoning_effort": reasoning_effort,
+            "image_max_edge": int(image_max_edge), "jpeg_quality": int(jpeg_quality),
+            "caption_prefix": caption_prefix, "banned_phrases": banned_phrases,
+        },)
 
 
 class WN_LocalAIModel:
@@ -716,8 +971,15 @@ class WN_LocalAIModel:
         return {
             "required": {
                 "model": (_model_choices(),),
-                "projector": (_clean_projector_choices(),),
-            }
+                "projector": (_clean_projector_choices(), {"tooltip":
+                    "Vision projector (mmproj) for image and video input. Auto / None picks the projector "
+                    "whose name matches the model, or a generically named one (e.g. mmproj-model-f16) sitting alone "
+                    "with the model in its own folder; "
+                    "if none matches, the model runs text-only. None: always text-only."}),
+            },
+            "optional": {
+                "memory": (MEMORY_MODES, {"default": MEMORY_MODES[0]}),
+            },
         }
 
     RETURN_TYPES = ("GGUF_LLM_CONFIG",)
@@ -725,20 +987,36 @@ class WN_LocalAIModel:
     FUNCTION = "build"
     CATEGORY = "WepeNerd/Local AI"
 
-    def build(self, model, projector="Auto / None"):
+    def build(self, model, projector=PROJECTOR_AUTO, memory=MEMORY_MODES[0]):
         if model.startswith("<"):
             raise RuntimeError("No Local AI models found in ComfyUI/models/LLM")
+        model_path = resolve_choice(model)
+        if projector == PROJECTOR_AUTO:
+            mmproj_path = match_projector(model_path)
+            if mmproj_path:
+                log.info("Local AI Model: using projector %s for %s", os.path.basename(mmproj_path), os.path.basename(model_path))
+            else:
+                log.info("Local AI Model: no matching projector found for %s; image and video input are unavailable", os.path.basename(model_path))
+        elif projector in ("", PROJECTOR_NONE, "(none)"):
+            mmproj_path = None
+        else:
+            mmproj_path = resolve_choice(projector, projector=True)
+        if memory not in MEMORY_MODES:
+            raise ValueError(f"Unknown memory mode: {memory}")
+        target_free_vram_mb, release, keep_alive = 24576, True, 0
+        if memory == MEMORY_MODES[1]:
+            target_free_vram_mb = _estimated_vram_mb(model_path, mmproj_path)
+        elif memory == MEMORY_MODES[2]:
+            release, keep_alive = False, 300
         config = WNGGUFConfig(
-            model_path=resolve_choice(model),
-            mmproj_path=(
-                None if projector in ("", "Auto / None", "(none)")
-                else resolve_choice(projector, projector=True)
-            ),
+            model_path=model_path,
+            mmproj_path=mmproj_path,
             server_executable="auto",
             context_size=8192,
             gpu_layers=-1,
-            target_free_vram_mb=24576,
-            release_after_generate=True,
+            target_free_vram_mb=target_free_vram_mb,
+            release_after_generate=release,
+            keep_alive_seconds=keep_alive,
             flash_attn="auto",
             cache_type_k="f16",
             cache_type_v="f16",
@@ -754,7 +1032,7 @@ class WN_PromptEnhancer:
             "required": {
                 "model": ("GGUF_LLM_CONFIG",),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
-                "skill": (["H3", "Krea 2", "Custom", *QWEN_IMAGE_SKILLS],),
+                "skill": (list(PROMPT_SKILLS),),
             },
             "optional": {
                 "system_prompt_override": ("STRING", {"multiline": True, "default": ""}),
@@ -762,25 +1040,39 @@ class WN_PromptEnhancer:
                 "image_role": (list(ENHANCEMENT_IMAGE_ROLES), {"default": "Visual inspiration",
                     "tooltip": "Image role for other skills. Qwen Image 2.1 uses the chosen skill and the roles in your prompt."}),
                 "reference_images": ("IMAGE", {"tooltip": "Additional references, appended after image. Connect one canvas to image and one source here for image 2 into image 1; sizes may differ. Both inputs accept batches."}),
+                "seed": SEED_WIDGET,
+                "instruction": ("STRING", {"multiline": True, "default": ""}),
+                "sampling": (SAMPLING_TYPE,),
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("enhanced_prompt",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("enhanced_prompt", "info")
     FUNCTION = "enhance"
     CATEGORY = "WepeNerd/Local AI"
 
-    def enhance(self, model, prompt, skill="H3", system_prompt_override="", image=None, image_role="Visual inspiration", reference_images=None):
-        style = {"H3": "minimax_h3", "Krea 2": "krea2", "Custom": "custom", **QWEN_IMAGE_SKILLS}.get(skill)
-        if style is None:
-            raise ValueError(f"Unknown Prompt Enhancer skill: {skill}")
+    def enhance(self, model, prompt, skill="H3", system_prompt_override="", image=None, image_role="Visual inspiration", reference_images=None, seed=0, instruction="", sampling=None):
+        style = _resolve_skill(skill, PROMPT_SKILLS, "Prompt Enhancer skill")
+        if style == "minimax_h3" and not system_prompt_override.strip():
+            # One H3 behaviour everywhere: same settings handling and output checks as the H3 node.
+            text, info = WN_H3PromptEnhancer().enhance(
+                model, prompt, image=image, image_role=image_role, reference_images=reference_images,
+                seed=seed, instruction=instruction, sampling=sampling,
+            )
+            return (text, "skill=H3 (via H3 Prompt Enhancer); " + info)
         prompt, system_prompt, content = _prepare_prompt_enhancement(
-            model, prompt, style, system_prompt_override, image, image_role, reference_images,
+            model, prompt, style, system_prompt_override, image, image_role, reference_images, instruction,
         )
-        _validate_request(model, prompt, 2048)
-        payload = _enhancement_payload(model.model_path, prompt, system_prompt, user_content=content)
+        _validate_request(model, prompt, sampling["max_tokens"] if sampling else 2048)
+        payload = _apply_sampling(
+            _enhancement_payload(model.model_path, prompt, system_prompt, user_content=content, seed=seed), sampling)
         result = _run_payloads(model, [payload], require_image=content is not None)[0]
-        return (clean_qwen_image_prompt(result) if style in QWEN_IMAGE_SKILLS.values() else result,)
+        text = clean_qwen_image_prompt(result) if style in QWEN_IMAGE_SKILLS.values() else result
+        instructions = ("system_prompt_override (replaces skill)" if system_prompt_override.strip()
+                        else "instruction added" if instruction.strip() and style != "custom" else "skill only")
+        info = (f"skill={skill}; images_sent={_image_count(content)}; instructions={instructions}; "
+                f"sampling={'Local AI Sampling' if sampling else 'built-in'}; seed={payload.get('seed')}; output_checks=none")
+        return (text, info)
 
 
 class WN_H3PromptEnhancer:
@@ -808,11 +1100,15 @@ class WN_H3PromptEnhancer:
                 "image": ("IMAGE",),
                 "image_role": (list(ENHANCEMENT_IMAGE_ROLES), {"default": "Visual inspiration",
                     "tooltip": "Auto mode: Visual inspiration → T2V; First frame → I2V; Reference image → Ref2V. Explicit mode overrides the format. Images are sent only to the local LLM."}),
+                "reference_images": ("IMAGE",),
+                "seed": SEED_WIDGET,
+                "instruction": ("STRING", {"multiline": True, "default": ""}),
+                "sampling": (SAMPLING_TYPE,),
             },
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("enhanced_prompt",)
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("enhanced_prompt", "info")
     FUNCTION = "enhance"
     CATEGORY = "WepeNerd/Local AI"
 
@@ -830,10 +1126,19 @@ class WN_H3PromptEnhancer:
         creative_freedom="Preserve",
         image=None,
         image_role="Visual inspiration",
+        seed=0,
+        reference_images=None,
+        instruction="",
+        sampling=None,
     ):
-        if image is not None and isinstance(prompt, str) and not prompt.strip() and creative_freedom == "Preserve":
+        notes = []
+        has_images = image is not None or reference_images is not None
+        if has_images and isinstance(prompt, str) and not prompt.strip() and creative_freedom == "Preserve":
             creative_freedom = "Develop scenario"
-        prompt = _image_prompt(prompt, image)
+            notes.append("creative_freedom Preserve -> Develop scenario (image with blank prompt)")
+        prompt = _image_prompt(prompt, image if image is not None else reference_images)
+        if sampling:
+            max_tokens = sampling["max_tokens"]
         _validate_request(model, prompt, max_tokens)
         for name, value, choices in (
             ("mode", mode, H3_MODES), ("task", task, H3_TASKS),
@@ -845,29 +1150,30 @@ class WN_H3PromptEnhancer:
         duration = float(duration_seconds)
         if not math.isfinite(duration) or duration < 0:
             raise ValueError("duration_seconds must be finite and nonnegative (0 = unspecified)")
-        if image is not None and mode == "Auto":
+        if has_images and mode == "Auto":
             mode = {"Visual inspiration": "T2V", "First frame": "I2V", "Reference image": "Ref2V"}.get(image_role, mode)
+            notes.append(f"mode Auto -> {mode} (from image_role {image_role})")
         context = json.dumps({
             "settings": {"generation_mode": mode, "task": task, "action_detail": action_detail,
                          "enhancement": enhancement, "duration_seconds": duration,
                          "creative_freedom": creative_freedom},
             "reference_context": reference_context.strip(), "user_request": prompt.strip(),
         }, ensure_ascii=False, indent=2)
-        content = _enhancement_image_content(model, context, image, image_role)
-        payload = _enhancement_payload(model.model_path, context,
-            select_h3_skill(load_skill("h3"), mode, creative_freedom), max_tokens, user_content=content)
-        result = _run_payloads(model, [payload], require_image=image is not None, check_text_context=image is None)[0]
-        image_count = sum(part["type"] == "image_url" for part in content) if content and image_role != "Visual inspiration" else 0
-        return (validate_h3_prompt(result, prompt, mode, duration, reference_context, image_count),)
-
-
-_CLEAN_IMAGE_STYLES = {
-    "Dataset": "dataset_natural",
-    "Detailed": "detailed_visual",
-    "Short": "short",
-    "Tags": "booru_tags",
-    "Custom": "custom",
-}
+        content = _enhancement_image_content(model, context, image, image_role, reference_images)
+        system_prompt = _add_direction(select_h3_skill(load_skill("h3"), mode, creative_freedom), instruction)
+        payload = _apply_sampling(
+            _enhancement_payload(model.model_path, context, system_prompt, max_tokens, user_content=content, seed=seed),
+            sampling)
+        result = _run_payloads(model, [payload], require_image=content is not None, check_text_context=content is None)[0]
+        image_count = _image_count(content) if content and image_role != "Visual inspiration" else 0
+        text = validate_h3_prompt(result, prompt, mode, duration, reference_context, image_count)
+        info = (f"mode={mode}; task={task}; action_detail={action_detail}; enhancement={enhancement}; "
+                f"creative_freedom={creative_freedom}; images_sent={_image_count(content)}; "
+                f"sampling={'Local AI Sampling' if sampling else 'built-in'}; seed={payload.get('seed')}; "
+                f"output_checks=passed")
+        if notes:
+            info += "; auto: " + ", ".join(notes)
+        return (text, info)
 
 
 class WN_ImageCaptioner:
@@ -877,10 +1183,13 @@ class WN_ImageCaptioner:
             "required": {
                 "model": ("GGUF_LLM_CONFIG",),
                 "image": ("IMAGE",),
-                "style": (list(_CLEAN_IMAGE_STYLES),),
+                "style": (list(IMAGE_CAPTION_SKILLS),),
             },
             "optional": {
                 "instruction": ("STRING", {"multiline": True, "default": ""}),
+                "trigger_word": ("STRING", {"default": ""}),
+                "concept_context": ("STRING", {"multiline": True, "default": ""}),
+                "sampling": (SAMPLING_TYPE,),
             },
         }
 
@@ -890,15 +1199,12 @@ class WN_ImageCaptioner:
     FUNCTION = "caption"
     CATEGORY = "WepeNerd/Local AI"
 
-    def caption(self, model, image, style="Dataset", instruction=""):
-        caption_style = _CLEAN_IMAGE_STYLES.get(style)
-        if caption_style is None:
-            raise ValueError(f"Unknown Image Captioner style: {style}")
-        effective_instruction = instruction.strip() or "Describe this image accurately and in detail."
-        override = instruction.strip() if style == "Custom" else ""
+    def caption(self, model, image, style="Dataset", instruction="", trigger_word="", concept_context="", sampling=None):
+        if _resolve_skill(style, IMAGE_CAPTION_SKILLS, "Image Captioner style") == "custom" and not instruction.strip():
+            raise ValueError("Custom needs your instruction: describe how to caption the image.")
         return WN_GGUFCaptionImage().caption(
-            model, image, effective_instruction, 512, 0.2, 0,
-            caption_style, "none", override, "", "", 1024, 90,
+            model, image, instruction.strip(), 768, 0.2, 0,
+            style, "none", "", "", "", 1024, 90, trigger_word, concept_context, sampling,
         )
 
 
@@ -909,7 +1215,7 @@ class WN_FolderCaptioner:
             "required": {
                 "model": ("GGUF_LLM_CONFIG",),
                 "folder": ("STRING", {"default": "", "tooltip": "Absolute image folder on the ComfyUI machine. One Queue run processes the whole folder and writes image_name.txt beside each image."}),
-                "skill": (list(CAPTION_SKILLS),),
+                "skill": (list(IMAGE_CAPTION_SKILLS), {"default": "Krea 2 - Character likeness"}),
             },
             "optional": {
                 "trigger_word": ("STRING", {"default": "", "tooltip": "Exact identity/style marker, optionally including a class noun. Leave blank for natural concept words or when your trainer inserts the trigger."}),
@@ -919,6 +1225,7 @@ class WN_FolderCaptioner:
                 "existing_captions": (EXISTING_CAPTIONS, {"default": "Skip", "tooltip": "Skip preserves all existing .txt files, including empty files. Overwrite replaces each caption only after a complete response."}),
                 "max_tokens": ("INT", {"default": 768, "min": 64, "max": 32768, "tooltip": "Caption output budget; must leave room in the model context for the skill and image."}),
                 "image_max_edge": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 64}),
+                "sampling": (SAMPLING_TYPE,),
             },
         }
 
@@ -935,8 +1242,10 @@ class WN_FolderCaptioner:
 
     def caption(self, model, folder, skill="Krea 2 - Character likeness", trigger_word="",
                 concept_context="", instruction="", include_subfolders=False,
-                existing_captions="Skip", max_tokens=768, image_max_edge=1024):
-        system, prompt = caption_instructions(skill, trigger_word, concept_context, instruction)
+                existing_captions="Skip", max_tokens=768, image_max_edge=1024, sampling=None):
+        if sampling:
+            max_tokens, image_max_edge = sampling["max_tokens"], sampling["image_max_edge"]
+        system, prompt, _cleanup = _image_caption_instructions(skill, instruction, trigger_word, concept_context)
         if image_max_edge < 64:
             raise ValueError("image_max_edge must be at least 64")
         root, pending, skipped, found = scan_caption_folder(folder, include_subfolders, existing_captions)
@@ -952,15 +1261,18 @@ class WN_FolderCaptioner:
                 for path in pending:
                     current_path = path
                     _check_interrupted()
-                    url = image_file_data_url(path, image_max_edge)
-                    yield _make_payload(prompt, system, max_tokens, 0.2, 0.8, 20, 0.0,
-                                        1.0, 0.0, 0.0, 0, "none", image_data_url=url)
+                    url = image_file_data_url(path, image_max_edge, sampling["jpeg_quality"] if sampling else 90)
+                    yield _apply_sampling(_make_payload(prompt, system, max_tokens, 0.2, 0.8, 20, 0.0,
+                                        1.0, 0.0, 0.0, 0, "none", image_data_url=url), sampling)
 
             try:
                 with closing(_iter_payloads(model, payloads(), len(pending), require_image=True)) as results:
                     for value in results:
                         _check_interrupted()
                         caption = clean_folder_caption(value, trigger_word)
+                        if sampling and (sampling["caption_prefix"].strip() or sampling["banned_phrases"].strip()):
+                            caption = _clean_caption(caption, "custom", sampling["caption_prefix"], sampling["banned_phrases"])
+                            caption = clean_folder_caption(caption, trigger_word)
                         if write_caption(root, current_path, caption, existing_captions):
                             written += 1
                         else:
@@ -978,15 +1290,6 @@ class WN_FolderCaptioner:
         return (report, written, skipped)
 
 
-_CLEAN_VIDEO_STYLES = {
-    "Dataset": "dataset_natural",
-    "Detailed": "detailed_visual",
-    "Motion + Camera": "motion_camera",
-    "Short": "short",
-    "Custom": "custom",
-}
-
-
 class WN_VideoCaptioner:
     @classmethod
     def INPUT_TYPES(cls):
@@ -994,10 +1297,11 @@ class WN_VideoCaptioner:
             "required": {
                 "model": ("GGUF_LLM_CONFIG",),
                 "video": ("VIDEO",),
-                "style": (list(_CLEAN_VIDEO_STYLES),),
+                "style": (list(VIDEO_CAPTION_SKILLS),),
             },
             "optional": {
                 "instruction": ("STRING", {"multiline": True, "default": ""}),
+                "sampling": (SAMPLING_TYPE,),
             },
         }
 
@@ -1006,19 +1310,19 @@ class WN_VideoCaptioner:
     FUNCTION = "caption"
     CATEGORY = "WepeNerd/Local AI"
 
-    def caption(self, model, video, style="Dataset", instruction=""):
-        caption_style = _CLEAN_VIDEO_STYLES.get(style)
-        if caption_style is None:
-            raise ValueError(f"Unknown Video Captioner style: {style}")
+    def caption(self, model, video, style="Dataset", instruction="", sampling=None):
+        caption_style = _resolve_skill(style, VIDEO_CAPTION_SKILLS, "Video Captioner style")
+        if caption_style == "custom" and not instruction.strip():
+            raise ValueError("Custom needs your instruction: describe how to caption the video.")
         effective_instruction = instruction.strip() or (
             "Describe this video accurately, including subjects, actions, state changes, object "
             "motion, camera movement, framing changes, environment, lighting or weather where "
             "visible, and beginning-to-end progression. Do not invent dialogue or audio."
         )
-        override = instruction.strip() if style == "Custom" else ""
+        override = instruction.strip() if caption_style == "custom" else ""
         caption, _info = _caption_video_request(
             model, video, effective_instruction, caption_style, "auto", "uniform",
-            12, 2.0, 24, 512, 0.2, 0, override, "", "", 1024, 90, "none",
+            12, 2.0, 24, 512, 0.2, 0, override, "", "", 1024, 90, "none", sampling,
         )
         return (caption,)
 
@@ -1026,10 +1330,10 @@ class WN_VideoCaptioner:
 class WN_GGUFLLMRelease:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}, "optional": {"trigger": ("STRING", {"default": ""})}}
+        return {"required": {}, "optional": {"trigger": ("STRING", {"default": ""}), "passthrough": (ANY_TYPE,)}}
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("status",)
+    RETURN_TYPES = ("STRING", ANY_TYPE)
+    RETURN_NAMES = ("status", "passthrough")
     FUNCTION = "release"
     CATEGORY = "WepeNerd/Local AI/Advanced"
     OUTPUT_NODE = True
@@ -1038,9 +1342,10 @@ class WN_GGUFLLMRelease:
     def IS_CHANGED(cls, **kwargs):
         return float("nan")
 
-    def release(self, trigger=""):
+    def release(self, trigger="", passthrough=None):
         pid = SERVER_MANAGER.stop()
-        return ((f"Released llama-server PID {pid}." if pid else "No managed llama-server process is running."),)
+        status = f"Released llama-server PID {pid}." if pid else "No managed llama-server process is running."
+        return (status, passthrough)
 
 
 class WN_GGUFLLMStatus:
@@ -1088,6 +1393,7 @@ NODE_CLASS_MAPPINGS = {
     "WN_GGUFCaptionVideo": WN_GGUFCaptionVideo,
     "WN_GGUFLLMRelease": WN_GGUFLLMRelease,
     "WN_GGUFLLMStatus": WN_GGUFLLMStatus,
+    "WN_LocalAISampling": WN_LocalAISampling,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1104,4 +1410,229 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WN_GGUFCaptionVideo": "Video Captioner (Advanced)",
     "WN_GGUFLLMRelease": "Unload Local AI Model",
     "WN_GGUFLLMStatus": "Local AI Status",
+    "WN_LocalAISampling": "Local AI Sampling",
 }
+
+
+# ---------------------------------------------------------------------------
+# Node descriptions and widget tooltips.
+# Kept in one place so the same setting is explained the same way on every node.
+# Tooltips already written inline in INPUT_TYPES take priority over these.
+# ---------------------------------------------------------------------------
+
+NODE_DESCRIPTIONS = {
+    "WN_LocalAIModel": "Pick a local GGUF model for the Local AI nodes. Uses an 8192-token context; "
+        "choose how VRAM is shared with ComfyUI under memory. Use Local AI Model (Advanced) for full control.",
+    "WN_PromptEnhancer": "Rewrite a prompt for a target model (H3, Krea 2, Qwen Image 2.1, Flux, Wan, LTX Video, SDXL) "
+        "using your local LLM. Optionally let the LLM look at images. H3 uses the same checks as H3 Prompt Enhancer.",
+    "WN_H3PromptEnhancer": "Build a structured H3 video prompt with control over generation mode, task type, "
+        "action detail and how much the LLM may invent. Checks the result before returning it.",
+    "WN_ImageCaptioner": "Caption each image in a batch with a vision model. Outputs one caption per image. "
+        "Has the same skills as Folder Captioner, so you can test a skill on one image first.",
+    "WN_FolderCaptioner": WN_FolderCaptioner.DESCRIPTION,
+    "WN_VideoCaptioner": "Caption a video with a vision model. Uses native video input when the server supports it, "
+        "otherwise samples frames across the clip.",
+    "WN_GGUFLLMConfig": "Full control over the local model server: context size, GPU layers, VRAM handoff, "
+        "keep-alive, KV cache, server path and GPU selection.",
+    "WN_GGUFLLMGenerate": "Send any prompt (and optionally an image) to the local model and get the raw reply. "
+        "All sampling settings exposed.",
+    "WN_GGUFPromptEnhance": "Deprecated: use Prompt Enhancer with Local AI Sampling connected. Kept so saved "
+        "workflows still load. H3 here is the raw skill without the H3 node's checks.",
+    "WN_GGUFCaptionImage": "Deprecated: use Image Captioner with Local AI Sampling connected. Kept so saved "
+        "workflows still load.",
+    "WN_LocalAISampling": "Generation settings for the Local AI task nodes. Connect it to a node's sampling input "
+        "to replace that node's built-in settings (max tokens, temperature, seed and so on).",
+    "WN_GGUFCaptionVideo": "Video Captioner with native/sampled video modes and frame sampling controls. "
+        "The info output reports which mode was used and which frames were sampled.",
+    "WN_GGUFLLMRelease": "Stop the local model server and free its VRAM. Put it inline with passthrough "
+        "(any value in, the same value out) so later steps wait until the LLM is unloaded.",
+    "WN_GGUFLLMStatus": "Show whether the local model server is running, which model is loaded, "
+        "its modalities and keep-alive time.",
+}
+
+_COMMON_TOOLTIPS = {
+    "model": "Connect Local AI Model or Local AI Model (Advanced).",
+    "config": "Connect Local AI Model or Local AI Model (Advanced).",
+    "max_tokens": "Maximum length of the reply, in tokens. Must fit in the model's context together with "
+        "the instructions and any images.",
+    "temperature": "Randomness. Low (0.1-0.3) is steady and literal; higher (0.7+) is more varied.",
+    "top_p": "Sample only from the most likely tokens that add up to this probability. Lower = more focused.",
+    "top_k": "Sample only from this many most likely tokens. 0 = no limit.",
+    "min_p": "Drop tokens less likely than this fraction of the top token. 0 = off.",
+    "repetition_penalty": "Discourage repeating recent tokens. 1.0 = off.",
+    "presence_penalty": "Discourage reusing any token that has already appeared. 0 = off.",
+    "frequency_penalty": "Discourage tokens in proportion to how often they have appeared. 0 = off.",
+    "seed": "Change for a different result. The same seed and inputs give the same output.",
+    "reasoning_effort": "Thinking budget for reasoning models. none = answer directly (fastest); "
+        "default = the model's own setting. Ignored by models that don't reason.",
+    "image": "Optional image(s) for the model to look at. Needs a vision model and its projector.",
+    "image_max_edge": "Images are shrunk so their longest side is at most this many pixels before being sent "
+        "to the model. Larger shows more detail but uses more context and VRAM.",
+    "jpeg_quality": "JPEG quality used when sending images to the model.",
+    "caption_prefix": "Text added to the start of every caption, e.g. a trigger word.",
+    "banned_phrases": "One phrase per line. Removed from the output (not case-sensitive).",
+    "video": "Video to caption, e.g. from Load Video.",
+    "instruction": "Optional extra direction for the captioner. With style Custom this is the complete instruction.",
+    "system_prompt_override": "Advanced: replaces the skill's built-in instructions entirely. "
+        "For extra direction, use instruction instead.",
+    "trigger_word": "Exact trigger word to include in every caption, e.g. ohwx. Leave blank if your trainer adds it.",
+    "concept_context": "Facts shared by every image, e.g. the character's name or the exact car model. "
+        "Used where it applies.",
+    "reference_images": "Additional reference images, sent after image. Accepts batches.",
+    "sampling": "Optional: connect Local AI Sampling to replace this node's built-in generation settings, "
+        "including its max_tokens and seed.",
+}
+
+_ENHANCER_INSTRUCTION = ("Extra direction added to the selected skill, e.g. 'keep it under 60 words'. "
+    "With Custom, this is the complete instruction.")
+
+_NODE_TOOLTIPS = {
+    "WN_LocalAIModel": {
+        "model": "GGUF model file from ComfyUI/models/LLM. Projector files (names with mmproj, projector "
+            "or vision) are listed under projector instead.",
+        "memory": "Unload ComfyUI models first: safest, but diffusion models reload afterwards. "
+            "Free only what the LLM needs: unloads just enough for this model (an estimate), so other models "
+            "can stay loaded. Keep LLM loaded for 5 min: faster repeated runs, but ComfyUI cannot see that VRAM; "
+            "use Unload Local AI Model before heavy image or video steps. All modes unload the LLM when done "
+            "(the last after 5 idle minutes).",
+    },
+    "WN_GGUFLLMConfig": {
+        "model": "GGUF model file from ComfyUI/models/LLM.",
+        "llama_server": "Path to the llama-server executable. auto uses LLAMA_SERVER_PATH or finds it on PATH.",
+        "context_size": "Tokens the model can hold at once: instructions, images and reply together. "
+            "Larger uses more VRAM. The simple model node uses 8192.",
+        "gpu_layers": "Model layers placed on the GPU. -1 = all. Lower it if you run out of VRAM "
+            "(slower; the rest runs from system RAM).",
+        "target_free_vram_mb": "Before loading, ask ComfyUI to unload its models until this much VRAM is free. "
+            "0 = only clear the cache. Not used when comfy_vram_handoff is never.",
+        "aggressive_vram_handoff": "Unload all ComfyUI models before loading the LLM, whatever target_free_vram_mb says.",
+        "release_after_generate": "Stop the LLM after each run to give its VRAM back. Turn off to keep it loaded "
+            "for faster repeated runs (see keep_alive_seconds).",
+        "mmproj": "Vision projector for this exact model. Needed for image and video input. (none) = text only.",
+        "startup_timeout_s": "How long to wait for llama-server to load the model before giving up.",
+        "request_timeout_s": "How long one generation may run before it is cancelled.",
+        "extra_server_args": "Extra llama-server command-line options, e.g. --threads 8.",
+        "keep_alive_seconds": "Only when release_after_generate is off: stop the idle server after this many "
+            "seconds. 0 = stay loaded until Unload Local AI Model.",
+        "flash_attn": "Flash Attention. auto lets llama.cpp decide.",
+        "cache_type_k": "Precision of the attention key cache. q8_0 uses about half the memory of f16, "
+            "with a possible small change in speed or quality.",
+        "cache_type_v": "Precision of the attention value cache. q8_0 uses about half the memory of f16, "
+            "with a possible small change in speed or quality.",
+        "image_min_tokens": "Minimum tokens per image, for models with variable image resolution. 0 = model default.",
+        "image_max_tokens": "Maximum tokens per image, for models with variable image resolution. 0 = model default.",
+        "cuda_visible_devices": "Run the LLM on specific GPU(s), e.g. 1. Affects only llama-server, not ComfyUI. "
+            "For a dedicated second GPU, also set comfy_vram_handoff to never.",
+        "comfy_vram_handoff": "Free ComfyUI VRAM before loading the LLM (auto or always), or skip it (never), "
+            "e.g. when the LLM runs on a separate GPU.",
+        "native_video_max_mb": "Largest video, in MB, sent as native video. In auto mode, bigger clips "
+            "fall back to sampled frames.",
+    },
+    "WN_GGUFLLMGenerate": {
+        "prompt": "Message sent to the model.",
+        "system_prompt": "Instructions that set the model's role and rules. Optional.",
+        "sampling_preset": "custom uses the sliders. The Qwen presets apply Qwen's recommended temperature, "
+            "top_p, top_k and min_p instead of the sliders.",
+    },
+    "WN_GGUFPromptEnhance": {
+        "prompt": "The prompt or idea to rewrite.",
+        "prompt_style": "Target model or format for the rewritten prompt. Custom uses your instruction.",
+        "instruction": _ENHANCER_INSTRUCTION,
+    },
+    "WN_PromptEnhancer": {
+        "prompt": "The prompt or idea to rewrite. With an image connected you can leave it blank.",
+        "skill": "Target model for the rewritten prompt. Custom uses your instruction as the whole skill.",
+        "instruction": _ENHANCER_INSTRUCTION,
+    },
+    "WN_H3PromptEnhancer": {
+        "mode": "H3 generation type. T2V: text to video. I2V: image to video. Ref2V: reference to video. "
+            "FL2V: first and last frame. The A variants also use supplied audio. Auto chooses from your text and image_role.",
+        "task": "What the shot is mainly about. Adds matching guidance. Auto lets the model decide.",
+        "action_detail": "Semantic: describe actions briefly by meaning. Detailed Visible Mechanics: spell out "
+            "the visible steps of a precise action. Auto uses mechanics only when needed.",
+        "enhancement": "How the wording is handled. Light: keep your wording, add little. Smart: resolve "
+            "ambiguity and tighten. Strict: make every constraint explicit. Does not allow new content; "
+            "that is creative_freedom.",
+        "instruction": "Extra direction added to the H3 skill, e.g. 'no camera cuts'.",
+    },
+    "WN_ImageCaptioner": {
+        "style": "Dataset: one factual training caption. Detailed: thorough description. Short: one line. "
+            "Tags: comma-separated booru tags. Motion + Camera: visible motion cues and viewpoint. "
+            "General caption / Krea 2: dataset skills that use trigger_word and concept_context. "
+            "Custom: your instruction is the whole skill.",
+    },
+    "WN_VideoCaptioner": {
+        "style": "Dataset: one factual training caption. Detailed: thorough description. Motion + Camera: "
+            "focus on movement and camera. Short: one line. Custom: use your instruction.",
+    },
+    "WN_GGUFCaptionImage": {
+        "instruction": "Request sent with each image, e.g. what to focus on.",
+        "caption_style": "Dataset: one factual training caption. Detailed: thorough description. Short: one line. "
+            "Tags: comma-separated booru tags. Motion + Camera: visible motion cues and viewpoint. "
+            "General caption / Krea 2: dataset skills that use trigger_word and concept_context. "
+            "Custom: your instruction is the whole skill.",
+    },
+    "WN_GGUFCaptionVideo": {
+        "instruction": "Request sent with the video, e.g. what to focus on.",
+        "caption_style": "Captioning skill. Custom uses system_prompt_override, or your instruction if that is empty.",
+        "video_mode": "auto: native video when the server reports support, otherwise sampled frames. "
+            "native_video: always send the video file. sampled_frames: always send still frames.",
+        "sampling_mode": "uniform: spread sample_frames evenly over the clip. fixed_fps: take sample_fps "
+            "frames per second, up to max_frames.",
+        "sample_frames": "Frames to take in uniform mode.",
+        "sample_fps": "Frames per second to take in fixed_fps mode.",
+        "max_frames": "Upper limit on frames sent in either mode. More frames use more context.",
+    },
+    "WN_FolderCaptioner": {
+        "include_subfolders": "Also caption images in subfolders. Captions are written beside each image.",
+        "skill": "Dataset: one factual training caption. Detailed: thorough description. Short: one line. "
+            "Tags: comma-separated booru tags. Motion + Camera: visible motion cues and viewpoint. "
+            "General caption / Krea 2: dataset skills that use trigger_word and concept_context. "
+            "Custom: your instruction is the whole skill.",
+    },
+    "WN_GGUFLLMRelease": {
+        "trigger": "Connect any text output so the unload happens after that node has finished.",
+        "passthrough": "Connect anything (a prompt, latent, image...). It is passed through unchanged after the "
+            "LLM is unloaded, so the next step waits for the unload.",
+    },
+    "WN_LocalAISampling": {
+        "preset": "custom uses the values below. The Qwen presets apply Qwen's recommended temperature, top_p, "
+            "top_k and min_p instead.",
+        "reasoning_effort": "default uses the preset's reasoning setting (high for qwen_thinking, none for "
+            "qwen_non_thinking), or the model default with custom. An explicit effort overrides the preset.",
+        "image_max_edge": "Images and video frames are shrunk so their longest side is at most this many pixels. "
+            "Applies to the captioners.",
+        "jpeg_quality": "JPEG quality for images and frames sent by the captioners.",
+        "caption_prefix": "Text added to the start of every caption. Applies to the captioners.",
+        "banned_phrases": "One phrase per line, removed from captions. Applies to the captioners.",
+    },
+}
+
+
+def _with_tooltip(spec, tip):
+    if len(spec) == 1:
+        return (spec[0], {"tooltip": tip})
+    options = dict(spec[1] or {})
+    options.setdefault("tooltip", tip)
+    return (spec[0], options, *spec[2:])
+
+
+def _install_help(node_id, cls):
+    if node_id in NODE_DESCRIPTIONS and not getattr(cls, "DESCRIPTION", None):
+        cls.DESCRIPTION = NODE_DESCRIPTIONS[node_id]
+    tips = {**_COMMON_TOOLTIPS, **_NODE_TOOLTIPS.get(node_id, {})}
+    original = cls.INPUT_TYPES
+
+    def INPUT_TYPES(klass):
+        inputs = original()
+        for section in ("required", "optional"):
+            for name, spec in list(inputs.get(section, {}).items()):
+                if name in tips and isinstance(spec, tuple) and spec:
+                    inputs[section][name] = _with_tooltip(spec, tips[name])
+        return inputs
+
+    cls.INPUT_TYPES = classmethod(INPUT_TYPES)
+
+
+for _node_id, _cls in NODE_CLASS_MAPPINGS.items():
+    _install_help(_node_id, _cls)

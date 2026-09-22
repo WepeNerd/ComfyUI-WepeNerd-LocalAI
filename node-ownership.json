@@ -14,6 +14,7 @@
     "WN_GGUFCaptionImage": "wn_gguf_nodes",
     "WN_GGUFCaptionVideo": "wn_gguf_nodes",
     "WN_GGUFLLMRelease": "wn_gguf_nodes",
-    "WN_GGUFLLMStatus": "wn_gguf_nodes"
+    "WN_GGUFLLMStatus": "wn_gguf_nodes",
+    "WN_LocalAISampling": "wn_gguf_nodes"
   }
 }

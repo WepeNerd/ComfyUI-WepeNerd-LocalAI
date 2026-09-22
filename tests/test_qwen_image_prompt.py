@@ -33,7 +33,8 @@ class QwenImagePromptTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
 
     def enhance(self, prompt="Change only the cup to blue.", skill="Qwen Image 2.1 - Edit", **kwargs):
-        return nodes.WN_PromptEnhancer().enhance(self.config, prompt, skill=skill, **kwargs)
+        # The second output is the new info string; these tests check the prompt output.
+        return nodes.WN_PromptEnhancer().enhance(self.config, prompt, skill=skill, **kwargs)[:1]
 
     def payload(self):
         return self.runner.call_args.args[1][0]
@@ -137,9 +138,11 @@ class QwenImagePromptTests(unittest.TestCase):
         self.assertTrue(system.startswith("Use restrained technical wording."))
         self.assertNotIn("# Qwen Image", system)
 
-    def test_existing_h3_image_role_and_output_remain_unchanged(self):
+    def test_h3_skill_uses_the_h3_node_path_with_image_role(self):
         self.runner.return_value = ["  Existing H3 result.  "]
-        self.assertEqual(self.enhance("", "H3", image=self.canvas, image_role="First frame"), ("  Existing H3 result.  ",))
+        with patch.object(nodes, "validate_h3_prompt", side_effect=lambda result, *args: result) as check:
+            self.assertEqual(self.enhance("", "H3", image=self.canvas, image_role="First frame"), ("  Existing H3 result.  ",))
+        self.assertEqual(check.call_args.args[2], "I2V")  # Auto mode follows the image role, as on the H3 node
         content = self.payload()["messages"][-1]["content"]
         self.assertIn("short video scenario", content[0]["text"])
         self.assertIn("video's opening frame", content[1]["text"])
@@ -158,8 +161,12 @@ class QwenImagePromptTests(unittest.TestCase):
         for schema in (simple, advanced):
             self.assertEqual(list(schema["optional"])[:3], ["system_prompt_override", "image", "image_role"])
             self.assertEqual(schema["optional"]["reference_images"][0], "IMAGE")
-        self.assertEqual(simple["required"]["skill"][0][:3], ["H3", "Krea 2", "Custom"])
-        self.assertEqual(nodes.WN_PromptEnhancer.RETURN_TYPES, ("STRING",))
+        # Saved workflows store the skill name, so every earlier name must still be offered.
+        self.assertEqual(simple["required"]["skill"][0][0], "H3")
+        self.assertLessEqual({"H3", "Krea 2", "Custom", *qwen.QWEN_IMAGE_SKILLS}, set(simple["required"]["skill"][0]))
+        # Output 0 is unchanged, so saved links keep working; info was added after it.
+        self.assertEqual(nodes.WN_PromptEnhancer.RETURN_TYPES, ("STRING", "STRING"))
+        self.assertEqual(nodes.WN_PromptEnhancer.RETURN_NAMES[0], "enhanced_prompt")
         ownership = json.loads((ROOT / "node-ownership.json").read_text())
         self.assertEqual(set(PACKAGE.NODE_CLASS_MAPPINGS), set(ownership["nodes"]))
 

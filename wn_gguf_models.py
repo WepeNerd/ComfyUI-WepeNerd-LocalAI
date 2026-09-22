@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import threading
 import time
 
@@ -128,3 +129,45 @@ def resolve_choice(choice: str, projector: bool = False) -> str:
             "adding or moving model files under ComfyUI/models/LLM."
         )
     return str(path)
+
+
+_NAME_NOISE = {"mmproj", "projector", "vision", "model", "gguf"}
+_QUANT_TOKEN = re.compile(r"^(?:i?q\d+\w*|f16|f32|bf16|fp16|fp32|[a-z]|xs|xxs|nl)$")
+
+
+def _name_key(path: Path) -> str:
+    """Model identity from a filename, ignoring projector words and quantization tags."""
+    tokens = re.split(r"[-_.\s]+", path.stem.lower())
+    return "-".join(tok for tok in tokens if tok and tok not in _NAME_NOISE and not _QUANT_TOKEN.match(tok))
+
+
+def match_projector(model_path: str) -> str | None:
+    """Pick the projector that belongs to a model, or None when there is no confident match.
+
+    1. Name match: the projector's name parts (minus mmproj/quant tags) appear, in order
+       and as whole parts, in the model's name. The longest match wins; ties prefer the model's own folder.
+    2. Folder match: the model's folder holds exactly one model and one projector, and
+       that projector has a generic name such as ``mmproj-model-f16.gguf``.
+    """
+    model = Path(model_path).resolve()
+    model_key = _name_key(model)
+    projectors = list(_index(projectors=True).values())
+
+    scored = []
+    for projector in projectors:
+        key = _name_key(projector)
+        if len(key.replace("-", "")) >= 4 and f"-{key}-" in f"-{model_key}-":
+            scored.append((len(key), projector.parent == model.parent, projector))
+    if scored:
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        best = scored[0]
+        if len(scored) == 1 or (best[0], best[1]) != (scored[1][0], scored[1][1]):
+            return str(best[2])
+        return None
+
+    same_folder = [p for p in projectors if p.parent == model.parent]
+    models_in_folder = [m for m in _index(projectors=False).values() if m.parent == model.parent]
+    generic = len(same_folder) == 1 and len(_name_key(same_folder[0]).replace("-", "")) < 4
+    if generic and len(models_in_folder) == 1:
+        return str(same_folder[0])
+    return None

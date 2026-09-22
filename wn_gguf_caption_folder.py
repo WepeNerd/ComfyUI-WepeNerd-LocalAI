@@ -107,7 +107,7 @@ def validate_caption_target(root: Path, target: Path):
         raise ValueError(f"Caption destination is not a regular file: {target}")
 
 
-def image_file_data_url(path: Path, max_edge: int):
+def image_file_data_url(path: Path, max_edge: int, jpeg_quality: int = 90):
     _check_interrupted()
     with Image.open(path) as source:
         if getattr(source, "n_frames", 1) != 1:
@@ -116,7 +116,7 @@ def image_file_data_url(path: Path, max_edge: int):
         oriented.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
         mode = "RGBA" if "A" in oriented.getbands() or "transparency" in oriented.info else "RGB"
         pixels = np.asarray(oriented.convert(mode), dtype=np.float32) / 255.0
-    return encode_single_image(pixels, max_edge=max_edge, image_format="JPEG", jpeg_quality=90)
+    return encode_single_image(pixels, max_edge=max_edge, image_format="JPEG", jpeg_quality=jpeg_quality)
 
 
 def clean_folder_caption(text: str, trigger_word: str):
